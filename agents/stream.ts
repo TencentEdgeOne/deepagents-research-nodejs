@@ -9,7 +9,7 @@
  */
 
 import { initChatModel, tool } from 'langchain';
-import { modelRetryMiddleware, toolRetryMiddleware } from 'langchain';
+import { modelRetryMiddleware, toolRetryMiddleware, toolCallLimitMiddleware } from 'langchain';
 import { createDeepAgent, CompositeBackend, StateBackend, StoreBackend, type SubAgent } from 'deepagents';
 
 type Model = Awaited<ReturnType<typeof initChatModel>>;
@@ -47,7 +47,7 @@ function getEnv(contextEnv: Record<string, string | undefined> | undefined): Env
 async function getModel(env: Env): Promise<Model> {
   if (!model) {
     logger.log('Initializing model...');
-    model = await initChatModel('@makers/minimax-m2.7', {
+    model = await initChatModel('@makers/hy3-preview', {
       modelProvider: 'openai',
       apiKey: env.AI_GATEWAY_API_KEY,
       configuration: {
@@ -75,16 +75,22 @@ function getAgent(modelInstance: Model, checkpointer: any, store: any, contextTo
         `You are an expert researcher. Today is ${today}.\n` +
         `CRITICAL: You MUST respond in the EXACT same language as your task description. If the task is in Chinese, your ENTIRE output must be in Chinese. If in English, respond in English.\n\n` +
         `Workflow:\n` +
-        `1. Call web_search 2-3 times with different queries to gather information from multiple angles.\n` +
-        `2. Once you have enough data, STOP searching and write your final summary immediately.\n\n` +
-        `IMPORTANT: Do NOT keep searching endlessly. After 3 searches, you MUST write your summary regardless of whether you feel the data is complete.\n\n` +
+        `1. Call web_search 3-5 times with different queries to gather information from multiple angles.\n` +
+        `2. After your searches complete, IMMEDIATELY write your final summary. Do NOT call web_search again.\n\n` +
+        `HARD LIMIT: You may call web_search AT MOST 5 times total. After finishing your searches, you MUST stop and write your summary — no exceptions, no "let me search more".\n\n` +
         `Output rules:\n` +
-        `- Only output your summary text (under 500 English words or 300 Chinese characters) with source URLs.\n` +
-        `- No raw JSON, no tool output echoes, no file operations.`,
+        `- After searching, output ONLY your summary text (under 600 Chinese characters or 400 English words).\n` +
+        `- Do NOT narrate your search process (e.g. "Let me search...", "I will look for...").\n` +
+        `- Do NOT echo raw JSON from tool results.\n` +
+        `- Do NOT say you want to search more. Just write the summary.`,
       tools: webSearchTools,
       middleware: [
         modelRetryMiddleware({ maxRetries: 3 }),
         toolRetryMiddleware({ maxRetries: 2, tools: ['web_search'] }),
+        toolCallLimitMiddleware({
+          toolName: 'web_search',
+          runLimit: 15,
+        }),
       ],
     };
 
@@ -94,10 +100,10 @@ function getAgent(modelInstance: Model, checkpointer: any, store: any, contextTo
         `You are a lead researcher. Today is ${today}.\n` +
         `CRITICAL: You MUST use the EXACT same language as the user. If the user writes in Chinese, ALL your output (plan text AND task descriptions) MUST be in Chinese. If in English, use English.\n\n` +
         `Process:\n` +
-        `1. In ONE single response: write a 1-2 sentence research plan, then immediately call all task tools together.\n` +
-        `2. Delegate 2-3 sub-questions via the task tool. You MUST call ALL tasks in a SINGLE response at the same time for parallel execution. NEVER call tasks one by one across multiple turns.\n` +
-        `3. Wait for ALL sub-agent results, then synthesize a concise final answer (under 600 English words or 400 Chinese characters) with citations.\n\n` +
+        `1. On your FIRST response, you MUST call the task tool to delegate 2-3 sub-questions. You may optionally include a brief plan sentence before the tool calls, but tool calls are MANDATORY in the first response.\n` +
+        `2. Wait for ALL sub-agent results, then synthesize a concise final answer (under 400 English words or 600 Chinese characters).\n\n` +
         `Rules:\n` +
+        `- Your first response MUST contain task tool calls. Never respond with only text and no tool calls.\n` +
         `- ALL task tool calls MUST happen in ONE single model response — batch them together.\n` +
         `- Do NOT dispatch additional tasks after receiving sub-agent results.\n` +
         `- Task descriptions MUST be in the user's language.\n` +
@@ -183,8 +189,7 @@ async function* eventStream(
     const nsSegmentToCard = new Map<string, { cardId: string; saId: string }>();
     const taskToolCallIdToCard = new Map<string, { cardId: string; saId: string }>();
     const emittedToolCallIds = new Set<string>();
-    const subagentBlockBuffers = new Map<string, string>();
-    const subagentBlockSkips = new Set<string>();
+    const subagentTextBuffers = new Map<string, string>();
     let subagentCounter = 0;
 
     // ── Event loop ──
@@ -219,35 +224,27 @@ async function* eventStream(
 
           // Subagent text (depth >= 2, known card)
           if (depth >= 2 && subagentNsSegment && nsSegmentToCard.has(subagentNsSegment)) {
-            // Buffer start of block to detect JSON echo from model
-            const blockKey = `${subagentNsSegment}:${data.index ?? 0}:${data.run_id ?? ''}`;
-            if (!subagentBlockBuffers.has(blockKey)) {
-              subagentBlockBuffers.set(blockKey, '');
-            }
-            const buf = subagentBlockBuffers.get(blockKey)!;
-
-            if (buf.length < 20) {
-              const newBuf = buf + content;
-              subagentBlockBuffers.set(blockKey, newBuf);
-              const trimmed = newBuf.trimStart();
-              if (trimmed.length >= 10) {
-                if (trimmed.startsWith('[{"title":')) {
-                  subagentBlockSkips.add(blockKey);
-                  continue;
-                }
-                subagentBlockBuffers.delete(blockKey);
-                const card = nsSegmentToCard.get(subagentNsSegment)!;
-                const flushed = newBuf.replace(/\n{3,}/g, '\n\n');
-                if (flushed) {
-                  yield send({ type: 'ai', source: 'subagent', content: flushed, subagent_id: card.saId, tool_call_id: card.cardId });
-                }
-              }
-              continue;
-            }
-
-            if (subagentBlockSkips.has(blockKey)) continue;
             const card = nsSegmentToCard.get(subagentNsSegment)!;
-            yield send({ type: 'ai', source: 'subagent', content, subagent_id: card.saId, tool_call_id: card.cardId });
+            // Buffer subagent text per-card to strip JSON tool result echoes
+            const bufKey = card.saId;
+            if (!subagentTextBuffers.has(bufKey)) subagentTextBuffers.set(bufKey, '');
+            subagentTextBuffers.set(bufKey, subagentTextBuffers.get(bufKey)! + content);
+
+            // Flush buffer: strip JSON tool result echoes (individual objects and arrays)
+            const buf = subagentTextBuffers.get(bufKey)!;
+            const cleaned = buf
+              .replace(/\[?\{["\u201c]title["\u201d]:.*?"engine":\s*"[^"]*"\s*\}[\],]*/g, '')
+              .replace(/^\[[\s,]*\]/, '')
+              .replace(/[\[\]]/g, '');
+            // Only flush if we have enough to be confident JSON won't span next token
+            // or if content ends with a sentence-ending char
+            if (cleaned.length > 50 || /[。\.\n]$/.test(cleaned)) {
+              subagentTextBuffers.set(bufKey, '');
+              const trimmed = cleaned.replace(/\n{3,}/g, '\n\n').replace(/^[\s,\[\]]+/, '').replace(/[\s,\[\]]+$/, '');
+              if (trimmed) {
+                yield send({ type: 'ai', source: 'subagent', content: trimmed, subagent_id: card.saId, tool_call_id: card.cardId });
+              }
+            }
 
           } else if (depth <= 1 && (!subagentNsSegment || !nsSegmentToCard.has(subagentNsSegment))) {
             // Main agent text
@@ -255,11 +252,9 @@ async function* eventStream(
           }
         }
 
-        // Reset block tracking on new content-block-start
+        // Reset block tracking on new content-block-start (no-op now, kept for future use)
         if (eventType === 'content-block-start' && depth >= 2 && subagentNsSegment) {
-          const blockKey = `${subagentNsSegment}:${data.index ?? 0}:${data.run_id ?? ''}`;
-          subagentBlockBuffers.delete(blockKey);
-          subagentBlockSkips.delete(blockKey);
+          // placeholder
         }
 
         continue;
@@ -296,6 +291,20 @@ async function* eventStream(
         if (depth <= 1 && toolEvent === 'tool-finished') {
           const card = taskToolCallIdToCard.get(toolCallId);
           if (card) {
+            // Flush any remaining buffered text for this subagent
+            const remaining = subagentTextBuffers.get(card.saId) || '';
+            if (remaining) {
+              const cleaned = remaining
+                .replace(/\[?\{["\u201c]title["\u201d]:.*?"engine":\s*"[^"]*"\s*\}[\],]*/g, '')
+                .replace(/^\[[\s,]*\]/, '')
+                .replace(/[\[\]]/g, '')
+                .replace(/\n{3,}/g, '\n\n')
+                .replace(/^[\s,]+/, '');
+              if (cleaned.trim()) {
+                yield send({ type: 'ai', source: 'subagent', content: cleaned, subagent_id: card.saId, tool_call_id: card.cardId });
+              }
+              subagentTextBuffers.delete(card.saId);
+            }
             logger.log(`task-finished: saId=${card.saId}`);
             yield send({ type: 'subagent_complete', source: 'main', tool_call_id: card.cardId, subagent_id: card.saId });
           }
@@ -347,8 +356,8 @@ async function* eventStream(
     try {
       const finalState = await agentInstance.graph.getState({ configurable: { thread_id: conversationId } });
       const msgs = finalState?.values?.messages || [];
-      if (msgs.length > 0) {
-        const lastMsg = msgs[msgs.length - 1];
+      const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+      if (lastMsg) {
         const msgType = typeof lastMsg._getType === 'function' ? lastMsg._getType() : lastMsg.type;
         if (msgType === 'ai') {
           let text = '';

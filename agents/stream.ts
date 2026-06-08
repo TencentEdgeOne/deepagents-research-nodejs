@@ -4,13 +4,15 @@
  * Architecture: Lead Researcher delegates sub-questions to Expert Researcher
  * subagents (with web_search), then synthesizes a final answer.
  *
- * Streaming: iterates raw ProtocolEvents from streamEvents v3, mapping them to
- * SSE events for the frontend (subagent_pending, tool_call, ai, etc.).
+ * Streaming: uses agentInstance.stream() with streamMode: ["updates", "messages"]
+ * and subgraphs: true. Description-to-card matching at complete time uses
+ * ToolMessage content prefix comparison.
  */
 
 import { initChatModel, tool } from 'langchain';
 import { modelRetryMiddleware, toolRetryMiddleware, toolCallLimitMiddleware } from 'langchain';
 import { createDeepAgent, CompositeBackend, StateBackend, StoreBackend, type SubAgent } from 'deepagents';
+import { AIMessageChunk, ToolMessage } from '@langchain/core/messages';
 
 type Model = Awaited<ReturnType<typeof initChatModel>>;
 type Agent = ReturnType<typeof createDeepAgent>;
@@ -47,7 +49,7 @@ function getEnv(contextEnv: Record<string, string | undefined> | undefined): Env
 async function getModel(env: Env): Promise<Model> {
   if (!model) {
     logger.log('Initializing model...');
-    model = await initChatModel('@makers/hy3-preview', {
+    model = await initChatModel('@makers/deepseek-v4-flash', {
       modelProvider: 'openai',
       apiKey: env.AI_GATEWAY_API_KEY,
       configuration: {
@@ -86,7 +88,7 @@ function getAgent(modelInstance: Model, checkpointer: any, store: any, contextTo
       tools: webSearchTools,
       middleware: [
         modelRetryMiddleware({ maxRetries: 3 }),
-        toolRetryMiddleware({ maxRetries: 2, tools: ['web_search'] }),
+        toolRetryMiddleware({ maxRetries: 1, tools: ['web_search'] }),
         toolCallLimitMiddleware({
           toolName: 'web_search',
           runLimit: 15,
@@ -151,208 +153,190 @@ async function* eventStream(
   conversationId: string,
   signal?: AbortSignal,
 ): AsyncGenerator<string> {
+  const knownSubagents = new Map<string, { saId: string }>();
+  const pendingDescriptions = new Map<string, string>();
+  const emittedToolCallIds = new Set<string>();
+  const emittedToolResultIds = new Set<string>();
+  const toolCallIdToName = new Map<string, string>();
+
+  function extractNsSegment(ns: string[]): string {
+    return ns.find((s) => s.startsWith('tools:')) ?? '';
+  }
+
+  function shortId(nsSegment: string): string {
+    return nsSegment.split(':').pop()?.slice(0, 8) ?? '';
+  }
+
+  function ensureSubagent(nsSegment: string): { saId: string } {
+    if (knownSubagents.has(nsSegment)) return knownSubagents.get(nsSegment)!;
+    const saId = shortId(nsSegment);
+    knownSubagents.set(nsSegment, { saId });
+    return { saId };
+  }
+
   function send(event: StreamEvent): string {
     return `data: ${JSON.stringify(event)}\n\n`;
   }
 
-  // Guard against unhandled rejections from SDK internals (SubagentTransformer
-  // rejects promises on tool-error that we don't consume via projections).
-  const rejectionHandler = (reason: unknown) => {
-    logger.log(`Swallowed unhandled rejection: ${String(reason).slice(0, 100)}`);
-  };
-  process.on('unhandledRejection', rejectionHandler);
-
   try {
-    const run = await (agentInstance as any).streamEvents(
+    const stream = await agentInstance.stream(
       { messages: [{ role: 'user', content: message }] },
       {
-        version: 'v3',
         configurable: { thread_id: conversationId },
+        streamMode: ['updates', 'messages'],
+        subgraphs: true,
         signal,
-      },
+      } as any,
     );
 
-    // Catch projection promise rejections we can reach directly
-    const noop = () => {};
-    if (run.output?.catch) run.output.catch(noop);
-    if (run.subagents?.[Symbol.asyncIterator]) {
-      (async () => {
-        try {
-          for await (const sa of run.subagents) {
-            sa.output?.catch?.(noop);
-          }
-        } catch {}
-      })();
-    }
-
-    // ── State ──
-    const nsSegmentToCard = new Map<string, { cardId: string; saId: string }>();
-    const taskToolCallIdToCard = new Map<string, { cardId: string; saId: string }>();
-    const emittedToolCallIds = new Set<string>();
-    const subagentTextBuffers = new Map<string, string>();
-    let subagentCounter = 0;
-
-    // ── Event loop ──
-    for await (const event of run) {
+    for await (const tuple of stream) {
       if (signal?.aborted) break;
 
-      const ns: string[] = event.params?.namespace ?? [];
-      const method: string = event.method ?? '';
-      const data: any = event.params?.data ?? {};
-      const depth = ns.length;
-      const subagentNsSegment = (depth >= 1 && ns[0].startsWith('tools:')) ? ns[0] : '';
+      const [chunkNs, chunkType, chunkData] = tuple as any as [string[], string, any];
+      const nsSegment = extractNsSegment(chunkNs);
+      const isSubagent = !!nsSegment;
 
-      // ── MESSAGES: text tokens ──
-      if (method === 'messages') {
-        const eventType: string = data.event ?? '';
+      // ── "updates" mode: lifecycle + tool events ──
+      if (chunkType === 'updates') {
+        const data: Record<string, any> = chunkData ?? {};
 
-        if (eventType === 'content-block-delta') {
-          const delta = data.delta;
-          if (!delta) continue;
-
-          // Only accept text-delta; skip block-delta (tool_call streaming) etc.
-          let text = '';
-          if (typeof delta === 'object' && delta.type === 'text-delta') {
-            text = delta.text ?? '';
-          } else if (typeof delta === 'string') {
-            text = delta;
+        for (const [nodeName, nodeData] of Object.entries(data)) {
+          // (A) Main agent model_request → task tool_calls
+          if (!isSubagent && nodeName === 'model_request') {
+            const messages = (nodeData as any)?.messages ?? [];
+            for (const msg of messages) {
+              for (const tc of msg?.tool_calls ?? []) {
+                if (tc.name !== 'task') continue;
+                const desc = (tc.args?.description ?? '').slice(0, 500);
+                const saType = tc.args?.subagent_type ?? 'researcher';
+                pendingDescriptions.set(tc.id, desc);
+                yield send({
+                  type: 'subagent_pending',
+                  source: 'main',
+                  tool_call_id: tc.id,
+                  subagent_type: saType,
+                  description: desc,
+                });
+              }
+            }
           }
-          if (!text) continue;
 
-          const content = text.replace(/\n{3,}/g, '\n\n');
-          if (!content) continue;
+          // (B) Subagent namespace events
+          if (isSubagent) {
+            const { saId } = ensureSubagent(nsSegment);
 
-          // Subagent text (depth >= 2, known card)
-          if (depth >= 2 && subagentNsSegment && nsSegmentToCard.has(subagentNsSegment)) {
-            const card = nsSegmentToCard.get(subagentNsSegment)!;
-            // Buffer subagent text per-card to strip JSON tool result echoes
-            const bufKey = card.saId;
-            if (!subagentTextBuffers.has(bufKey)) subagentTextBuffers.set(bufKey, '');
-            subagentTextBuffers.set(bufKey, subagentTextBuffers.get(bufKey)! + content);
+            yield send({
+              type: 'subagent_step',
+              source: 'subagent',
+              subagent_id: saId,
+            });
 
-            // Flush buffer: strip JSON tool result echoes (individual objects and arrays)
-            const buf = subagentTextBuffers.get(bufKey)!;
-            const cleaned = buf
-              .replace(/\[?\{["\u201c]title["\u201d]:.*?"engine":\s*"[^"]*"\s*\}[\],]*/g, '')
-              .replace(/^\[[\s,]*\]/, '')
-              .replace(/[\[\]]/g, '');
-            // Only flush if we have enough to be confident JSON won't span next token
-            // or if content ends with a sentence-ending char
-            if (cleaned.length > 50 || /[。\.\n]$/.test(cleaned)) {
-              subagentTextBuffers.set(bufKey, '');
-              const trimmed = cleaned.replace(/\n{3,}/g, '\n\n').replace(/^[\s,\[\]]+/, '').replace(/[\s,\[\]]+$/, '');
-              if (trimmed) {
-                yield send({ type: 'ai', source: 'subagent', content: trimmed, subagent_id: card.saId, tool_call_id: card.cardId });
+            // (B1) Subagent model_request → tool_calls
+            if (nodeName === 'model_request') {
+              const stateMessages = (nodeData as any)?.messages ?? [];
+              for (const msg of stateMessages) {
+                for (const tc of (msg as any)?.tool_calls ?? []) {
+                  if (!tc?.name) continue;
+                  const tcRealId: string = tc.id ?? '';
+                  if (tcRealId && emittedToolCallIds.has(tcRealId)) continue;
+                  if (tcRealId) {
+                    emittedToolCallIds.add(tcRealId);
+                    toolCallIdToName.set(tcRealId, tc.name);
+                  }
+
+                  const argsStr = typeof tc.args === 'string'
+                    ? tc.args
+                    : tc.args != null ? JSON.stringify(tc.args) : '';
+
+                  yield send({
+                    type: 'tool_call',
+                    source: 'subagent',
+                    name: tc.name,
+                    subagent_id: saId,
+                    tool_call_id: tcRealId,
+                    ...(argsStr && { args: argsStr }),
+                  });
+                }
               }
             }
 
-          } else if (depth <= 1 && (!subagentNsSegment || !nsSegmentToCard.has(subagentNsSegment))) {
-            // Main agent text
-            yield send({ type: 'ai', source: 'main', content });
-          }
-        }
+            // (B2) Subagent tools node → tool completion
+            if (nodeName === 'tools') {
+              const stateMessages = (nodeData as any)?.messages ?? [];
+              for (const msg of stateMessages) {
+                if (!ToolMessage.isInstance(msg) && (msg as any)?.type !== 'tool') continue;
+                const toolTcId: string = (msg as any).tool_call_id ?? '';
+                const resolvedName = msg.name ?? toolCallIdToName.get(toolTcId) ?? '';
+                if (resolvedName === 'task') continue;
+                if (toolTcId && emittedToolResultIds.has(toolTcId)) continue;
+                if (toolTcId) emittedToolResultIds.add(toolTcId);
 
-        // Reset block tracking on new content-block-start (no-op now, kept for future use)
-        if (eventType === 'content-block-start' && depth >= 2 && subagentNsSegment) {
-          // placeholder
+                yield send({
+                  type: 'tool',
+                  source: 'subagent',
+                  tool_name: resolvedName,
+                  subagent_id: saId,
+                  tool_call_id: toolTcId,
+                });
+              }
+            }
+          }
+
+          // (C) Main agent tools node → task ToolMessage → subagent_complete
+          if (!isSubagent && nodeName === 'tools') {
+            const messages = (nodeData as any)?.messages ?? [];
+            for (const msg of messages) {
+              if (msg.type !== 'tool' || msg.name !== 'task') continue;
+              const taskToolCallId = msg.tool_call_id ?? '';
+
+              let contentText = '';
+              if (typeof msg.content === 'string') {
+                contentText = msg.content;
+              } else if (Array.isArray(msg.content)) {
+                contentText = msg.content
+                  .filter((block: any) => block.type === 'text')
+                  .map((block: any) => block.text || '')
+                  .join('');
+              }
+
+              yield send({
+                type: 'subagent_complete',
+                source: 'main',
+                tool_call_id: taskToolCallId,
+                description: pendingDescriptions.get(taskToolCallId) || '',
+                content: contentText.slice(0, 100),
+              });
+            }
+          }
         }
 
         continue;
       }
 
-      // ── TOOLS: lifecycle events ──
-      if (method === 'tools') {
-        const toolEvent: string = data.event ?? '';
-        const toolCallId: string = data.tool_call_id ?? '';
-        const toolName: string = data.tool_name ?? '';
+      // ── "messages" mode: stream text tokens ──
+      if (chunkType === 'messages') {
+        const [msg] = chunkData;
+        if (!AIMessageChunk.isInstance(msg)) continue;
+        if (!msg.text || msg.tool_call_chunks?.length) continue;
 
-        // Task started (depth <= 1) → register subagent
-        if (depth <= 1 && toolName === 'task' && toolEvent === 'tool-started') {
-          const rawInput = data.input;
-          const input = typeof rawInput === 'string' ? JSON.parse(rawInput) : rawInput ?? {};
-          const subagentType: string = input.subagent_type ?? input.agentName ?? 'researcher';
-          const description: string = input.description ?? '';
+        const content = msg.text.replace(/\n{3,}/g, '\n\n');
+        if (!content) continue;
 
-          const saId = `sa-${++subagentCounter}`;
-          const cardId = saId;
-          const actualNsSegment = ns[0] ?? '';
-
-          if (actualNsSegment) nsSegmentToCard.set(actualNsSegment, { cardId, saId });
-          taskToolCallIdToCard.set(toolCallId, { cardId, saId });
-
-          logger.log(`task-started: saId=${saId}, desc=${description.slice(0, 60)}`);
-
-          yield send({ type: 'subagent_pending', source: 'main', tool_call_id: cardId, subagent_id: saId, subagent_type: subagentType, description: description.slice(0, 500) });
-          yield send({ type: 'subagent_step', source: 'subagent', subagent_id: saId, tool_call_id: cardId });
-          continue;
-        }
-
-        // Task finished (depth <= 1) → subagent complete
-        if (depth <= 1 && toolEvent === 'tool-finished') {
-          const card = taskToolCallIdToCard.get(toolCallId);
-          if (card) {
-            // Flush any remaining buffered text for this subagent
-            const remaining = subagentTextBuffers.get(card.saId) || '';
-            if (remaining) {
-              const cleaned = remaining
-                .replace(/\[?\{["\u201c]title["\u201d]:.*?"engine":\s*"[^"]*"\s*\}[\],]*/g, '')
-                .replace(/^\[[\s,]*\]/, '')
-                .replace(/[\[\]]/g, '')
-                .replace(/\n{3,}/g, '\n\n')
-                .replace(/^[\s,]+/, '');
-              if (cleaned.trim()) {
-                yield send({ type: 'ai', source: 'subagent', content: cleaned, subagent_id: card.saId, tool_call_id: card.cardId });
-              }
-              subagentTextBuffers.delete(card.saId);
-            }
-            logger.log(`task-finished: saId=${card.saId}`);
-            yield send({ type: 'subagent_complete', source: 'main', tool_call_id: card.cardId, subagent_id: card.saId });
-          }
-          continue;
-        }
-
-        // Task error (depth <= 1) → subagent complete
-        if (depth <= 1 && toolEvent === 'tool-error') {
-          const card = taskToolCallIdToCard.get(toolCallId);
-          if (card) {
-            logger.error(`task-error: saId=${card.saId}, msg=${data.message}`);
-            yield send({ type: 'subagent_complete', source: 'main', tool_call_id: card.cardId, subagent_id: card.saId });
-          }
-          continue;
-        }
-
-        // Subagent internal tools (depth >= 2)
-        if (depth >= 2 && subagentNsSegment && toolName !== 'task') {
-          const card = nsSegmentToCard.get(subagentNsSegment);
-          if (!card) continue;
-
-          if (toolEvent === 'tool-started') {
-            if (toolCallId && emittedToolCallIds.has(toolCallId)) continue;
-            if (toolCallId) emittedToolCallIds.add(toolCallId);
-
-            const rawInput = data.input;
-            const argsStr = rawInput != null
-              ? (typeof rawInput === 'string' ? rawInput : JSON.stringify(rawInput))
-              : '';
-
-            yield send({ type: 'tool_call', source: 'subagent', name: toolName || '(unknown)', subagent_id: card.saId, tool_call_id: toolCallId, ...(argsStr && { args: argsStr }) });
-          } else if (toolEvent === 'tool-finished' || toolEvent === 'tool-error') {
-            yield send({ type: 'tool', source: 'subagent', tool_name: toolName || '(unknown)', subagent_id: card.saId, tool_call_id: toolCallId });
-          }
-        }
-        continue;
-      }
-
-      // ── LIFECYCLE: subagent step events ──
-      if (method === 'lifecycle' && depth >= 2 && subagentNsSegment) {
-        const card = nsSegmentToCard.get(subagentNsSegment);
-        if (card && data.event === 'started') {
-          yield send({ type: 'subagent_step', source: 'subagent', subagent_id: card.saId, tool_call_id: card.cardId });
+        if (isSubagent) {
+          const { saId } = ensureSubagent(nsSegment);
+          yield send({
+            type: 'ai',
+            source: 'subagent',
+            content,
+            subagent_id: saId,
+          });
+        } else {
+          yield send({ type: 'ai', source: 'main', content });
         }
       }
     }
 
-    // Check for errors stored in final state (e.g. LLM quota exceeded)
+    // ── Post-stream: check for unstreamed errors in final state ──
     try {
       const finalState = await agentInstance.graph.getState({ configurable: { thread_id: conversationId } });
       const msgs = finalState?.values?.messages || [];
@@ -381,8 +365,6 @@ async function* eventStream(
       logger.error('Stream error:', error.message);
       yield send({ type: 'error', source: 'main', content: `Stream error: ${error.constructor.name}: ${String(error.message).slice(0, 200)}` });
     }
-  } finally {
-    process.removeListener('unhandledRejection', rejectionHandler);
   }
 
   yield 'data: [DONE]\n\n';

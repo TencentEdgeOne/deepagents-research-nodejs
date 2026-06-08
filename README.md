@@ -82,7 +82,7 @@ The agent runs as a **session-mode** runtime: requests sharing the same `convers
 ### Key Mechanisms
 
 - **Deep Agents + LangGraph**: the `createDeepAgent` function builds a LangGraph graph with subagent orchestration, middleware (retry), checkpointer, and store.
-- **streamEvents v3**: raw protocol events are iterated and mapped to typed SSE events (`ai`, `tool_call`, `tool`, `subagent_pending/step/complete`, `error`).
+- **Dual stream mode**: uses `stream()` with `streamMode: ['updates', 'messages']` and `subgraphs: true` to capture both lifecycle events and token-level text, mapped to typed SSE events (`ai`, `tool_call`, `tool`, `subagent_pending/step/complete`, `error`).
 - **Platform tools**: `web_search` is provided by the EdgeOne Makers runtime via `context.tools.toLangChainTools()`.
 - **Checkpointer**: conversation state (messages, tool results) is persisted via `context.store.langgraphCheckpointer`, enabling history restoration.
 

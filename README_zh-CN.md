@@ -82,7 +82,7 @@ Agent 以**会话模式**运行：相同 `conversation_id` 的请求路由到同
 ### 核心机制
 
 - **Deep Agents + LangGraph**：`createDeepAgent` 构建带子 Agent 编排、中间件（重试）、Checkpointer 和 Store 的 LangGraph 图。
-- **streamEvents v3**：迭代原始协议事件，映射为类型化 SSE 事件（`ai`、`tool_call`、`tool`、`subagent_pending/step/complete`、`error`）。
+- **双流模式**：使用 `stream()` 的 `streamMode: ['updates', 'messages']` + `subgraphs: true` 同时捕获生命周期事件和逐 token 文本，映射为类型化 SSE 事件（`ai`、`tool_call`、`tool`、`subagent_pending/step/complete`、`error`）。
 - **平台工具**：`web_search` 由 EdgeOne Makers 运行时通过 `context.tools.toLangChainTools()` 提供。
 - **Checkpointer**：对话状态（消息、工具结果）通过 `context.store.langgraphCheckpointer` 持久化，支持历史恢复。
 

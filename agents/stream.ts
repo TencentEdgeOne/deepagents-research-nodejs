@@ -363,7 +363,7 @@ async function* eventStream(
       logger.log('Stream aborted by user');
     } else {
       logger.error('Stream error:', error.message);
-      yield send({ type: 'error', source: 'main', content: `Stream error: ${error.constructor.name}: ${String(error.message).slice(0, 200)}` });
+      yield send({ type: 'error', source: 'main', content: `Stream error: ${error.constructor.name}: ${String(error.message).slice(0, 500)}` });
     }
   }
 

@@ -1,5 +1,5 @@
 /**
- * Deep Research Agent — EdgeOne Pages handler.
+ * Deep Research Agent — EdgeOne Makers handler.
  *
  * Architecture: Lead Researcher delegates sub-questions to Expert Researcher
  * subagents (with web_search), then synthesizes a final answer.
@@ -370,7 +370,7 @@ async function* eventStream(
   yield 'data: [DONE]\n\n';
 }
 
-// ─── EdgeOne Pages handler ───
+// ─── EdgeOne Makers handler ───
 
 export async function onRequest(context: any) {
   const { request, env, conversation_id: conversationId, run_id: runId } = context;

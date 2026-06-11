@@ -4,7 +4,7 @@
 
 **Framework:** Deep Agents · **Category:** Quick Start · **Language:** TypeScript
 
-[![Deploy to EdgeOne Makers](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://edgeone.ai/makers/new?template=deepagents-research-starter-node&from=within&fromAgent=1&agentLang=typescript)
+[![Deploy to EdgeOne Makers](https://cdnstatic.tencentcs.com/edgeone/pages/deploy.svg)](https://console.cloud.tencent.com/edgeone/makers/new?template=deepagents-research-starter-node&from=within&fromAgent=1&agentLang=typescript)
 
 ## 概览
 

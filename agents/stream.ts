@@ -20,6 +20,7 @@ type Agent = ReturnType<typeof createDeepAgent>;
 interface Env {
   AI_GATEWAY_API_KEY: string;
   AI_GATEWAY_BASE_URL: string;
+  AI_GATEWAY_MODEL: string;
 }
 
 import { createLogger } from './_logger';
@@ -33,23 +34,22 @@ let agent: Agent | null = null;
 
 function getEnv(contextEnv: Record<string, string | undefined> | undefined): Env {
   const source = contextEnv ?? {};
-  const required = ['AI_GATEWAY_API_KEY', 'AI_GATEWAY_BASE_URL'] as const;
-  const missing = required.filter((k) => !source[k]?.trim());
-
-  if (missing.length) {
-    throw new Error(`Missing environment variables: ${missing.join(', ')}`);
+  const apiKey = source.AI_GATEWAY_API_KEY?.trim() || "";
+  const baseUrl = source.AI_GATEWAY_BASE_URL?.trim() || "";
+  if (!apiKey || !baseUrl) {
+    throw new Error("Missing AI_GATEWAY_API_KEY or AI_GATEWAY_BASE_URL");
   }
-
   return {
-    AI_GATEWAY_API_KEY: source.AI_GATEWAY_API_KEY!,
-    AI_GATEWAY_BASE_URL: source.AI_GATEWAY_BASE_URL!,
+    AI_GATEWAY_API_KEY: apiKey,
+    AI_GATEWAY_BASE_URL: baseUrl,
+    AI_GATEWAY_MODEL: source.AI_GATEWAY_MODEL?.trim() || "@makers/deepseek-v4-flash",
   };
 }
 
 async function getModel(env: Env): Promise<Model> {
   if (!model) {
     logger.log('Initializing model...');
-    model = await initChatModel('@makers/deepseek-v4-flash', {
+    model = await initChatModel(env.AI_GATEWAY_MODEL, {
       modelProvider: 'openai',
       apiKey: env.AI_GATEWAY_API_KEY,
       configuration: {

@@ -49,7 +49,12 @@ function getEnv(contextEnv: Record<string, string | undefined> | undefined): Env
 async function getModel(env: Env): Promise<Model> {
   if (!model) {
     logger.log('Initializing model...');
-    model = await initChatModel(env.AI_GATEWAY_MODEL, {
+    const modelId = env.AI_GATEWAY_MODEL;
+    // DeepSeek models support thinking/reasoning; disable via modelKwargs
+    const modelKwargs = modelId.toLowerCase().includes('deepseek')
+      ? { thinking: { type: 'disabled' } }
+      : undefined;
+    model = await initChatModel(modelId, {
       modelProvider: 'openai',
       apiKey: env.AI_GATEWAY_API_KEY,
       configuration: {
@@ -57,6 +62,7 @@ async function getModel(env: Env): Promise<Model> {
       },
       temperature: 0,
       timeout: 300_000,
+      modelKwargs,
     });
   }
   return model;

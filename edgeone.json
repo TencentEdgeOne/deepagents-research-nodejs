@@ -1,4 +1,5 @@
 {
+  "$schema": "https://cdnstatic.tencentcs.com/edgeone/pages/docs/edgeone.schema.json",
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "agents": {

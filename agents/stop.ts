@@ -1,12 +1,13 @@
 // Abort a specific active agent run by conversationId.
-
+import type { AgentContext } from '@edgeone/types';
 import { createLogger } from './_logger';
 
 const logger = createLogger('stop');
 
-export async function onRequest(context: any) {
+export async function onRequest(context: AgentContext) {
   const { request } = context;
-  const conversationId = request?.body?.conversationId as string | undefined;
+  const body = (request?.body ?? {}) as Record<string, any>;
+  const conversationId = body.conversationId as string | undefined;
   logger.log('conversationId:', conversationId);
 
   if (!conversationId) {

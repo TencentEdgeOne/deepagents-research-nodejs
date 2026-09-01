@@ -24,6 +24,7 @@ interface Env {
 }
 
 import { createLogger } from './_logger';
+import type { AgentContext } from '@edgeone/types';
 
 const logger = createLogger('research-stream');
 
@@ -378,16 +379,17 @@ async function* eventStream(
 
 // ─── EdgeOne Makers handler ───
 
-export async function onRequest(context: any) {
+export async function onRequest(context: AgentContext) {
   const { request, env, conversation_id: conversationId, run_id: runId } = context;
   logger.log('conversationId:', conversationId, 'runId:', runId);
 
-  const body = request?.body ?? {};
+  const body = (request?.body ?? {}) as Record<string, any>;
   const action = body.action || 'chat';
-  const signal = request?.signal as AbortSignal | undefined;
+  const signal = request?.signal;
 
-  const checkpointer = context.store.langgraphCheckpointer;
-  const store = context.store.langgraphStore;
+  // LangGraph checkpointer/store 由平台注入，具体类型由 langgraph 包定义
+  const checkpointer = context.store.langgraphCheckpointer as any;
+  const store = context.store.langgraphStore as any;
 
   // ── Delete conversation ──
   if (action === 'delete') {
